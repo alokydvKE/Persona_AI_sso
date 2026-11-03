@@ -1,0 +1,1 @@
+export const ApiRecaptcha = import.meta.env.VITE_REACT_RECAPTCHA;

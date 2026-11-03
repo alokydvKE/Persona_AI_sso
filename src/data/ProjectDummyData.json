@@ -1,0 +1,125 @@
+[
+  {
+    "id": "1",
+    "title": "EverSip Persona Study",
+    "description": "Research focused on customer beverage habits and engagement trends.",
+    "createdAt": "Nov 15, 2025",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Survey Results.pdf" },
+      { "id": "2", "title": "User Interviews.docx" }
+    ],
+    "personas": [{ "id": "1" }, { "id": "2" }]
+  },
+  {
+    "id": "2",
+    "title": "Tech Product Launch Research",
+    "description": "Analysis of customer expectations for a SaaS product launch.",
+    "createdAt": "Jan 8, 2026",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Launch Strategy.pdf" }
+    ],
+    "personas": [{ "id": "1" }]
+  },
+  {
+    "id": "3",
+    "title": "Fitness App User Insights",
+    "description": "Behavioral insights from fitness app users.",
+    "createdAt": "Feb 2, 2026",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Workout Trends.csv" },
+      { "id": "2", "title": "Analytics Dashboard.fig" }
+    ],
+    "personas": [{ "id": "1" }, { "id": "2" }]
+  },
+  {
+    "id": "4",
+    "title": "AI Shopping Assistant Research",
+    "description": "Study on AI commerce and personalization.",
+    "createdAt": "Mar 18, 2026",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Persona Mapping.pdf" },
+      { "id": "2", "title": "Behavior Patterns.xlsx" }
+    ],
+    "personas": [{ "id": "1" }, { "id": "2" }, { "id": "3" }]
+  },
+  {
+    "id": "5",
+    "title": "Remote Work Productivity Study",
+    "description": "Insights about remote employee productivity.",
+    "createdAt": "Apr 6, 2026",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Employee Survey.pdf" }
+    ],
+    "personas": [{ "id": "1" }]
+  },
+  {
+    "id": "6",
+    "title": "Gaming Community Persona Mapping",
+    "description": "Research on gamer behavior and online communities.",
+    "createdAt": "May 11, 2026",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Community Survey.pdf" },
+      { "id": "2", "title": "Streamer Analytics.xlsx" }
+    ],
+    "personas": [{ "id": "1" }, { "id": "2" }]
+  },
+  {
+    "id": "7",
+    "title": "Smart Home Device Feedback",
+    "description": "User testing and usability analysis for IoT devices.",
+    "createdAt": "Jun 3, 2026",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Device Feedback.docx" }
+    ],
+    "personas": [{ "id": "1" }, { "id": "2" }, { "id": "3" }]
+  },
+  {
+    "id": "8",
+    "title": "E-Learning Platform Study",
+    "description": "Research into student learning patterns and engagement.",
+    "createdAt": "Jul 21, 2026",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Student Interviews.pdf" },
+      { "id": "2", "title": "Course Metrics.xlsx" }
+    ],
+    "personas": [{ "id": "1" }]
+  },
+  {
+    "id": "9",
+    "title": "Food Delivery User Research",
+    "description": "Insights into delivery speed expectations and app usability.",
+    "createdAt": "Aug 14, 2026",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Delivery Insights.pdf" },
+      { "id": "2", "title": "UX Feedback.txt" }
+    ],
+    "personas": [{ "id": "1" }, { "id": "2" }]
+  },
+  {
+    "id": "10",
+    "title": "Travel Booking Experience Study",
+    "description": "Analysis of traveler booking behavior and preferences.",
+    "createdAt": "Sep 9, 2026",
+    "role":"",
+    "files": [
+      { "id": "1", "title": "Traveler Survey.pdf" },
+      { "id": "2", "title": "Booking Analytics.xlsx" },
+      { "id": "3", "title": "Persona Notes.docx" }
+    ],
+    "personas": [
+      { "id": "1" },
+      { "id": "2" },
+      { "id": "3" },
+      { "id": "4" }
+    ]
+  }
+]

@@ -1,0 +1,559 @@
+import { toast } from "sonner";
+import { streamSpeech, type SpeechStreamArgs } from "@/api/Voice/voice";
+import { isAbortError } from "@/services/apiService";
+import { chunkFrames, type AudioChunk } from "./pcm";
+import { isSpeakable, takeSpeakablePieces } from "./sentences";
+
+export type SpeechItem = {
+  /** Message id — what the UI shows as loading/playing. */
+  id: string;
+  text: string;
+  /** Persona name; keeps each persona on one voice. */
+  speakerKey?: string;
+  /** Group chat the speaker is in; lets the backend use the persona's stored voice. */
+  groupId?: string;
+};
+
+/** An utterance opened before its text exists (a reply that is still streaming). */
+export type UtteranceInfo = Omit<SpeechItem, "text">;
+
+export type SpeechStatus = "idle" | "loading" | "playing";
+
+// The slice of Web Audio the player uses, so tests can supply a fake.
+export interface PlayableBuffer {
+  readonly duration: number;
+  copyToChannel(source: Float32Array, channel: number): void;
+}
+export interface PlayableSource {
+  buffer: PlayableBuffer | null;
+  onended: (() => void) | null;
+  connect(destination: unknown): unknown;
+  start(when: number): void;
+  stop(): void;
+  disconnect(): void;
+}
+export interface AudioOutput {
+  readonly currentTime: number;
+  readonly state: string;
+  readonly destination: unknown;
+  resume(): Promise<void>;
+  createBuffer(channels: number, length: number, sampleRate: number): PlayableBuffer;
+  createBufferSource(): PlayableSource;
+}
+
+type Deps = {
+  synthesize: (args: SpeechStreamArgs) => Promise<void>;
+  /** A fresh audio output, or null where Web Audio is unavailable. */
+  createOutput: () => AudioOutput | null;
+  onError: (message: string) => void;
+};
+
+/** Pieces synthesized at once (the backend caps provider concurrency too). */
+const MAX_CONCURRENT_FETCHES = 2;
+/** How many upcoming pieces may be fetched ahead of the one playing. */
+const MAX_LOOKAHEAD = 4;
+/** Recently synthesized pieces kept for replay. */
+const CACHE_SIZE = 40;
+/** Scheduling margin so the first chunk never starts "in the past". */
+const START_LEAD_S = 0.05;
+/** Breath between one persona finishing and the next starting. */
+const UTTERANCE_GAP_S = 0.35;
+/** How long to wait for a suspended output to resume before calling it blocked. */
+const RESUME_TIMEOUT_MS = 1_500;
+
+const PLAYBACK_ERROR = "Couldn't play the reply aloud.";
+const UNSUPPORTED = "This browser can't play replies aloud.";
+const AUTOPLAY_BLOCKED =
+  "Your browser blocked audio playback. Turn on read-aloud again to allow it.";
+
+type Job = {
+  controller: AbortController;
+  chunks: AudioChunk[];
+  done: boolean;
+  error: unknown;
+  waiters: Array<() => void>;
+};
+
+type Piece = { key: string; text: string; announce: boolean; job: Job | null };
+
+type Utterance = UtteranceInfo & {
+  /** Text received but not yet cut into pieces. */
+  buffer: string;
+  pieces: Piece[];
+  /** Index of the next piece to play. */
+  next: number;
+  /** No more text is coming. */
+  closed: boolean;
+  discarded: boolean;
+  /** A piece has been cut (so later ones don't announce the speaker again). */
+  released: boolean;
+  /** Audio of this utterance has been scheduled. */
+  started: boolean;
+};
+
+type Scheduled = { id: string; start: number; end: number; source: PlayableSource };
+
+/**
+ * Reads persona replies aloud while they are still being written.
+ *
+ * A reply is an utterance: `open` it when its first text arrives, `append`
+ * text as it streams, `end` it when the reply is complete (`enqueue` does all
+ * three for a finished reply). Text is cut into sentence-sized pieces as soon
+ * as they are complete (see sentences.ts); each piece is synthesized with
+ * streamed TTS and its audio scheduled on a Web Audio clock the moment it
+ * arrives, so a persona starts talking roughly one sentence after it starts
+ * typing, and pieces join up without gaps.
+ *
+ * Utterances play strictly in the order they were opened (one persona
+ * finishes before the next starts), while up to two pieces — possibly of
+ * later utterances — are synthesized ahead. `stop` cancels everything:
+ * playback, queue and in-flight requests.
+ */
+export class SpeechPlayer {
+  private readonly deps: Deps;
+  private out: AudioOutput | null = null;
+  private utterances: Utterance[] = [];
+  private scheduled: Scheduled[] = [];
+  /** Audio-clock time the last scheduled chunk ends. */
+  private playhead = 0;
+  private status: { id: string | null; state: SpeechStatus } = { id: null, state: "idle" };
+  /** Bumped by stop(); async steps from an older generation bail out. */
+  private generation = 0;
+  private looping = false;
+  private signalWaiters: Array<() => void> = [];
+
+  private running = 0;
+  private readonly cache = new Map<string, AudioChunk[]>();
+
+  private readonly listeners = new Set<() => void>();
+  private readonly blockedListeners = new Set<() => void>();
+
+  constructor(deps: Deps) {
+    this.deps = deps;
+  }
+
+  // ---------- subscriptions (useSyncExternalStore) ----------
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  statusOf = (id: string): SpeechStatus =>
+    this.status.id === id ? this.status.state : "idle";
+
+  /** Called when the browser refuses to start playback (autoplay policy). */
+  onAutoplayBlocked(listener: () => void): () => void {
+    this.blockedListeners.add(listener);
+    return () => this.blockedListeners.delete(listener);
+  }
+
+  // ---------- commands: streaming ----------
+
+  /** Queue an utterance whose text will arrive through `append`. */
+  open(info: UtteranceInfo): void {
+    if (this.find(info.id)) return;
+    this.utterances.push({
+      ...info,
+      buffer: "",
+      pieces: [],
+      next: 0,
+      closed: false,
+      discarded: false,
+      released: false,
+      started: false,
+    });
+    this.refreshStatus();
+    void this.run();
+  }
+
+  /** More text for an open utterance. Ignored for unknown or ended ones. */
+  append(id: string, text: string): void {
+    const utterance = this.find(id);
+    if (!utterance || utterance.closed || !text) return;
+    utterance.buffer += text;
+    this.release(utterance, false);
+  }
+
+  /** No more text is coming: speak whatever is left. Safe to call twice. */
+  end(id: string): void {
+    const utterance = this.find(id);
+    if (!utterance || utterance.closed) return;
+    utterance.closed = true;
+    this.release(utterance, true);
+    this.wake();
+  }
+
+  /** Drop an utterance — queued, being fetched or already playing. */
+  discard(id: string): void {
+    const utterance = this.find(id);
+    if (!utterance) return;
+    utterance.discarded = true;
+    this.utterances = this.utterances.filter((u) => u !== utterance);
+    utterance.pieces.forEach((piece) => piece.job?.controller.abort());
+    this.silence(this.scheduled.filter((entry) => entry.id === id));
+    this.wake();
+    this.refreshStatus();
+  }
+
+  // ---------- commands: whole messages ----------
+
+  /** Queue a complete reply. */
+  enqueue(item: SpeechItem): void {
+    if (!item.text.trim() || this.find(item.id)) return;
+    const { text, ...info } = item;
+    this.open(info);
+    this.append(item.id, text);
+    this.end(item.id);
+  }
+
+  /** Play one message now, or stop it if it is the one being read. */
+  toggle(item: SpeechItem): void {
+    const playingThis = this.status.id === item.id && this.status.state !== "idle";
+    this.stop();
+    if (!playingThis) this.enqueue(item);
+  }
+
+  stop(): void {
+    this.generation += 1;
+    this.looping = false;
+    this.utterances.forEach((u) => {
+      u.discarded = true;
+      u.pieces.forEach((piece) => piece.job?.controller.abort());
+    });
+    this.utterances = [];
+    this.silence(this.scheduled);
+    this.playhead = 0;
+    this.wake();
+    this.setStatus(null, "idle");
+  }
+
+  /**
+   * Call inside a user gesture (a click, a keypress that sends) so that audio
+   * started later, outside any gesture, is allowed by the autoplay policy.
+   */
+  prime(): void {
+    const out = this.output();
+    if (!out) return;
+    out.resume().catch(() => {
+      // Reported when playback is actually attempted.
+    });
+    try {
+      // Some browsers (iOS Safari) only unlock once a sound has started.
+      const silent = out.createBufferSource();
+      silent.buffer = out.createBuffer(1, 1, 22_050);
+      silent.connect(out.destination);
+      silent.start(0);
+    } catch {
+      // Unlocking is best effort.
+    }
+  }
+
+  // ---------- internals: text -> pieces ----------
+
+  private find(id: string): Utterance | undefined {
+    return this.utterances.find((u) => u.id === id);
+  }
+
+  private release(utterance: Utterance, final: boolean): void {
+    const { pieces, rest } = takeSpeakablePieces(utterance.buffer, {
+      first: !utterance.released,
+      final,
+    });
+    utterance.buffer = rest;
+    let added = false;
+    for (const text of pieces) {
+      // Markdown rules, lone bullets... have nothing to say.
+      if (!isSpeakable(text)) continue;
+      const announce = !utterance.released;
+      utterance.released = true;
+      utterance.pieces.push({
+        // The group is part of the key: the voice can differ with vs without it.
+        key: [utterance.groupId ?? "", utterance.speakerKey ?? "", announce ? "1" : "0", text].join("\u0000"),
+        text,
+        announce,
+        job: null,
+      });
+      added = true;
+    }
+    if (added) {
+      this.pumpFetches();
+      this.wake();
+    }
+  }
+
+  // ---------- internals: fetching ----------
+
+  /** Start synthesizing upcoming pieces, in play order, within the limits. */
+  private pumpFetches(): void {
+    let considered = 0;
+    for (const utterance of this.utterances) {
+      for (let i = utterance.next; i < utterance.pieces.length; i++) {
+        if (considered++ >= MAX_LOOKAHEAD) return;
+        const piece = utterance.pieces[i];
+        if (piece.job) continue;
+        if (this.running >= MAX_CONCURRENT_FETCHES) return;
+        this.fetchPiece(utterance, piece);
+      }
+    }
+  }
+
+  private fetchPiece(utterance: Utterance, piece: Piece): Job {
+    if (piece.job) return piece.job;
+
+    const cached = this.cache.get(piece.key);
+    if (cached) {
+      this.cache.delete(piece.key); // refresh recency
+      this.cache.set(piece.key, cached);
+      piece.job = { controller: new AbortController(), chunks: cached, done: true, error: null, waiters: [] };
+      return piece.job;
+    }
+
+    const job: Job = { controller: new AbortController(), chunks: [], done: false, error: null, waiters: [] };
+    piece.job = job;
+    const notify = () => {
+      const waiters = job.waiters;
+      job.waiters = [];
+      waiters.forEach((resolve) => resolve());
+    };
+    this.running += 1;
+    this.deps
+      .synthesize({
+        text: piece.text,
+        speakerKey: utterance.speakerKey,
+        groupId: utterance.groupId,
+        announce: piece.announce,
+        signal: job.controller.signal,
+        onChunk: (chunk) => {
+          job.chunks.push(chunk);
+          notify();
+        },
+      })
+      .then(
+        () => {
+          if (!job.controller.signal.aborted) this.remember(piece.key, job.chunks);
+        },
+        (error: unknown) => {
+          job.error = error;
+        },
+      )
+      .finally(() => {
+        this.running -= 1;
+        job.done = true;
+        notify();
+        this.pumpFetches();
+      });
+    return job;
+  }
+
+  private remember(key: string, chunks: AudioChunk[]): void {
+    if (chunks.length === 0) return;
+    this.cache.delete(key);
+    this.cache.set(key, chunks);
+    while (this.cache.size > CACHE_SIZE) {
+      this.cache.delete(this.cache.keys().next().value as string);
+    }
+  }
+
+  // ---------- internals: playback ----------
+
+  /** Plays utterances in order until the queue is empty. One loop at a time. */
+  private async run(): Promise<void> {
+    if (this.looping) return;
+    this.looping = true;
+    const generation = this.generation;
+    try {
+      while (generation === this.generation) {
+        const utterance = this.utterances[0];
+        if (!utterance) break;
+        const piece = utterance.pieces[utterance.next];
+        if (!piece) {
+          if (utterance.closed) {
+            this.utterances.shift();
+            this.refreshStatus();
+          } else {
+            await this.nextSignal(); // more text, an end, or a stop
+          }
+          continue;
+        }
+        utterance.next += 1;
+        this.pumpFetches();
+        await this.playPiece(utterance, piece, generation);
+      }
+    } finally {
+      if (generation === this.generation) this.looping = false;
+    }
+  }
+
+  /** Schedule a piece's audio chunk by chunk as it arrives. */
+  private async playPiece(utterance: Utterance, piece: Piece, generation: number): Promise<void> {
+    const job = this.fetchPiece(utterance, piece);
+    let index = 0;
+    for (;;) {
+      if (generation !== this.generation || utterance.discarded) return;
+      if (index < job.chunks.length) {
+        if (!(await this.schedule(utterance, job.chunks[index++], generation))) return;
+        continue;
+      }
+      if (job.done) break;
+      await new Promise<void>((resolve) => job.waiters.push(resolve));
+    }
+    // A failed piece is reported and skipped; the rest of the reply still plays.
+    if (job.error && !isAbortError(job.error)) this.deps.onError(errorMessage(job.error));
+  }
+
+  private async schedule(utterance: Utterance, chunk: AudioChunk, generation: number): Promise<boolean> {
+    const frames = chunkFrames(chunk);
+    if (frames === 0) return true;
+    const out = await this.ready(generation);
+    if (!out || generation !== this.generation || utterance.discarded) return false;
+
+    let source: PlayableSource;
+    let buffer: PlayableBuffer;
+    try {
+      buffer = out.createBuffer(chunk.channels.length, frames, chunk.sampleRate);
+      chunk.channels.forEach((data, channel) => buffer.copyToChannel(data, channel));
+      source = out.createBufferSource();
+      source.buffer = buffer;
+      source.connect(out.destination);
+    } catch {
+      this.deps.onError(PLAYBACK_ERROR);
+      return false;
+    }
+
+    let start = Math.max(this.playhead, out.currentTime + START_LEAD_S);
+    if (!utterance.started) {
+      utterance.started = true;
+      // A different persona is still talking: leave a breath between them.
+      if (this.scheduled.length > 0) start = Math.max(start, this.playhead + UTTERANCE_GAP_S);
+    }
+    const entry: Scheduled = { id: utterance.id, start, end: start + buffer.duration, source };
+    source.onended = () => {
+      this.scheduled = this.scheduled.filter((e) => e !== entry);
+      try {
+        source.disconnect();
+      } catch {
+        // Already disconnected.
+      }
+      this.refreshStatus();
+    };
+    source.start(start);
+    this.scheduled.push(entry);
+    this.playhead = entry.end;
+    this.refreshStatus();
+    return true;
+  }
+
+  /** The output, running — or null (reported) when it can't be. */
+  private async ready(generation: number): Promise<AudioOutput | null> {
+    const out = this.output();
+    if (!out) {
+      this.deps.onError(UNSUPPORTED);
+      this.stop();
+      return null;
+    }
+    if (out.state === "running") return out;
+    try {
+      await Promise.race([
+        out.resume(),
+        new Promise<void>((resolve) => setTimeout(resolve, RESUME_TIMEOUT_MS)),
+      ]);
+    } catch {
+      // Judged by the state below.
+    }
+    if (generation !== this.generation) return null;
+    if (out.state === "running") return out;
+    this.deps.onError(AUTOPLAY_BLOCKED);
+    this.stop();
+    this.blockedListeners.forEach((listener) => listener());
+    return null;
+  }
+
+  private output(): AudioOutput | null {
+    if (!this.out || this.out.state === "closed") {
+      this.out = this.deps.createOutput();
+      this.playhead = 0;
+    }
+    return this.out;
+  }
+
+  /** Stop scheduled sources now and forget them. */
+  private silence(entries: Scheduled[]): void {
+    if (entries.length === 0) return;
+    const gone = new Set(entries);
+    this.scheduled = this.scheduled.filter((entry) => !gone.has(entry));
+    for (const { source } of entries) {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch {
+        // Never started or already stopped.
+      }
+      try {
+        source.disconnect();
+      } catch {
+        // Already disconnected.
+      }
+    }
+    this.playhead = this.scheduled.reduce((end, entry) => Math.max(end, entry.end), 0);
+  }
+
+  private nextSignal(): Promise<void> {
+    return new Promise((resolve) => this.signalWaiters.push(resolve));
+  }
+
+  private wake(): void {
+    const waiters = this.signalWaiters;
+    this.signalWaiters = [];
+    waiters.forEach((resolve) => resolve());
+  }
+
+  /**
+   * Playing: whichever utterance is audible now (or starts next — chunks are
+   * scheduled a moment ahead). Loading: nothing audible, but an utterance is
+   * waiting for its text or audio. Idle otherwise.
+   */
+  private refreshStatus(): void {
+    if (this.scheduled.length > 0) {
+      const now = this.out?.currentTime ?? 0;
+      const current =
+        this.scheduled.find((entry) => entry.start <= now && now < entry.end) ??
+        this.scheduled.reduce((a, b) => (b.start < a.start ? b : a));
+      this.setStatus(current.id, "playing");
+    } else if (this.utterances.length > 0) {
+      this.setStatus(this.utterances[0].id, "loading");
+    } else {
+      this.setStatus(null, "idle");
+    }
+  }
+
+  private setStatus(id: string | null, state: SpeechStatus): void {
+    if (this.status.id === id && this.status.state === state) return;
+    this.status = { id, state };
+    this.listeners.forEach((listener) => listener());
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error && error.message ? error.message : PLAYBACK_ERROR;
+}
+
+function createBrowserOutput(): AudioOutput | null {
+  if (typeof window === "undefined") return null;
+  const Ctx =
+    window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!Ctx) return null;
+  try {
+    return new Ctx() as unknown as AudioOutput;
+  } catch {
+    return null;
+  }
+}
+
+export const speechPlayer = new SpeechPlayer({
+  synthesize: streamSpeech,
+  createOutput: createBrowserOutput,
+  // One toast id, so a string of failures (e.g. provider down) shows once.
+  onError: (message) => toast.error(message, { id: "speech-playback" }),
+});

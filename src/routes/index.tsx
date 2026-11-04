@@ -10,6 +10,7 @@ import PrivacyPolicyPage from "@/pages/Privacy-policy";
 import HomePage from "@/pages/Test";
 import PersonaAILoginPage from "@/pages/Login2";
 import UploadPage from "@/pages/Upload";
+import SsoLandingPage from "@/pages/SsoLanding";
 
 const Router = createBrowserRouter([
   {
@@ -23,6 +24,12 @@ const Router = createBrowserRouter([
   {
     path: "/login",
     element: <ProtectedRoute element={<PersonaAILoginPage />} reverse />,
+  },
+  {
+    // SSO launch landing (from the SSO portal). Not guarded either way: it is
+    // how a signed-out user signs in, and it replaces any current session.
+    path: "/sso",
+    element: <SsoLandingPage />,
   },
   // {
   //   path: "/sign-up",

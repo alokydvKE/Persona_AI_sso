@@ -351,6 +351,39 @@ export const useGroupDownloadInsightsLimit = (groupId: string | undefined) => {
   });
 };
 
+type InsignAILaunchResponse = {
+  launch_url: string;
+  expires_in: number;
+};
+
+/**
+ * One-time link that opens Insign AI already signed in, with this chat's
+ * survey prompt waiting in OptiBot. The backend gets it from the SSO
+ * orchestrator server to server; it works once, for about a minute, so open it
+ * straight away. `silent`: the caller shows its own error toast.
+ */
+export const useInsignAILaunch = (groupId: string | undefined) => {
+  const token = getAuthToken();
+
+  return useMutation<InsignAILaunchResponse, Error, void>({
+    mutationKey: ["group-insignai-launch", groupId],
+    mutationFn: () => {
+      if (!groupId) {
+        return Promise.reject(new Error("Group ID is required"));
+      }
+
+      return postApi<InsignAILaunchResponse>(
+        "persona/group-chat/insignai-launch",
+        {
+          token,
+          group_id: groupId,
+        },
+        { silent: true },
+      );
+    },
+  });
+};
+
 type GroupSurveyPromptLimitResponse = {
   used: number;
   limit: number;

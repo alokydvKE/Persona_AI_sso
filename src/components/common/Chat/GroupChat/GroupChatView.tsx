@@ -69,6 +69,7 @@ import {
   useGroupSurveyPrompt,
   useGroupDownloadInsightsLimit,
   useGroupSurveyPromptLimit,
+  useInsignAILaunch,
 } from "@/api/GroupChat/mutation";
 import { useGroupChatStream } from "@/api/GroupChat/useGroupChatStream";
 import { useActiveProjectId } from "@/hooks/useActiveProjectId";
@@ -518,6 +519,9 @@ function GroupChatView() {
     isPending: isSurveyPromptLimitLoading,
   } = useGroupSurveyPromptLimit(groupId);
 
+  const { mutateAsync: launchInsignAI, isPending: isInsignLaunching } =
+    useInsignAILaunch(groupId);
+
   // const handlePushToInsignAI = async () => {
   //   setPromptCopied(false);
   //   setSurveyPrompt("");
@@ -569,6 +573,40 @@ function GroupChatView() {
       setSurveyPrompt(limitResponse?.prompt ?? response?.prompt ?? "");
     } catch (error) {
       // toast.error("Failed to generate the questionnaire prompt.");
+    }
+  };
+
+  // Opens Insign AI already signed in, with the prompt waiting in OptiBot. The
+  // backend asks the SSO orchestrator for a one-time link (server to server, no
+  // cookies). The new tab is opened inside the click, before the request, so
+  // popup blockers allow it; it is pointed at the link once it arrives.
+  const handleGoToInsignAI = async () => {
+    if (!surveyPrompt) {
+      toast.info("No prompt available.");
+      return;
+    }
+
+    const tab = window.open("about:blank", "_blank");
+    try {
+      const { launch_url } = await launchInsignAI();
+      if (!launch_url) {
+        throw new Error("Couldn't open Insign AI. Please try again.");
+      }
+      if (tab && !tab.closed) {
+        tab.opener = null;
+        tab.location.replace(launch_url);
+      } else {
+        // Pop-ups blocked: the link is single use and short-lived, so use this tab.
+        window.location.assign(launch_url);
+      }
+      setInsignDialogOpen(false);
+    } catch (error) {
+      tab?.close();
+      toast.error(
+        error instanceof Error && error.message
+          ? error.message
+          : "Couldn't open Insign AI. Please try again.",
+      );
     }
   };
 
@@ -1048,8 +1086,8 @@ function GroupChatView() {
           {/* Header */}
           <DialogHeader className="shrink-0 pr-8 sm:pr-0">
             <DialogDescription className="text-md font-semibold text-foreground">
-              Your questionnaire prompt is ready. Please copy and paste it into
-              OptiBot to continue.
+              Your questionnaire prompt is ready. Go To Insign AI opens it in
+              OptiBot, already signed in.
             </DialogDescription>
 
             {/* <p className="text-sm text-muted-foreground">
@@ -1145,32 +1183,13 @@ function GroupChatView() {
                 disabled={
                   !surveyPrompt ||
                   isSurveyPromptLoading ||
-                  isSurveyPromptLimitLoading
+                  isSurveyPromptLimitLoading ||
+                  isInsignLaunching
                 }
-                onClick={() => {
-                  if (!surveyPrompt) {
-                    toast.info("No prompt available.");
-                    return;
-                  }
-
-                  if (!promptCopied) {
-                    toast.info(
-                      "Before pushing to Insign AI, please copy the prompt using the copy icon.",
-                    );
-                    return;
-                  }
-
-                  window.open(
-                    "https://platform.insignai.com/#/",
-                    "_blank",
-                    "noopener,noreferrer",
-                  );
-
-                  setInsignDialogOpen(false);
-                }}
+                onClick={handleGoToInsignAI}
               >
                 <MoveRight className="size-4" />
-                Go To Insign AI
+                {isInsignLaunching ? "Opening Insign AI…" : "Go To Insign AI"}
               </Button>
             </div>
           </DialogFooter>
